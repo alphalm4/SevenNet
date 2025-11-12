@@ -11,6 +11,7 @@ from .lmp_mliap_wrapper import SevenNetLAMMPSMLIAPWrapper
 
 logger = Logger(screen=True)
 
+
 def main(args=None):
     # === parse inputs ===
     parser = argparse.ArgumentParser(
@@ -20,7 +21,7 @@ def main(args=None):
     # positional arguments:
     parser.add_argument(
         'model_path',
-        help=f'path to a checkpoint model or name of model to use',
+        help='path to a checkpoint model or name of model to use',
         type=str,
     )
 
@@ -50,13 +51,6 @@ def main(args=None):
         action='store_true',
     )
 
-    parser.add_argument(
-        '--cutoff',
-        help='Neighbor cutoff (Angstrom). Required if it cannot be inferred from the model.',
-        type=float,
-        default=None,
-    )
-
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is required to create LAMMPS ML-IAP artefact.')
 
@@ -68,8 +62,7 @@ def main(args=None):
     if not str(out_path).endswith('.pt'):
         out_path = out_path.with_suffix(out_path.suffix + '.pt')
     modal = args.modal
-    cutoff = args.cutoff
-    use_cueq  = args.enable_cueq
+    use_cueq = args.enable_cueq
     use_flash = args.enable_flash
 
     # === create and save ML-IAP module ===
@@ -81,10 +74,10 @@ def main(args=None):
         modal=modal,
         enable_cueq=use_cueq,
         enable_flash=use_flash,
-        cutoff=cutoff,
     )
     torch.save(mliap_module, out_path)
     logger.writeline(f'LAMMPS ML-IAP artefact saved to {out_path}')
+
 
 if __name__ == '__main__':
     main()

@@ -32,10 +32,9 @@ class SevenNetLAMMPSMLIAPWrapper(MLIAPUnified):
         """
         kwargs:
             element_types: list[str], e.g., ['H','O']  # MUST match pair_coeff order
-            cutoff: float (Angstrom)                   # required if not inferable
             modal: Optional[str] = None
-            enable_cueq: bool = False
-            enable_flash: bool = False
+            use_cueq: bool = False
+            use_flash: bool = False
         """
 
         super().__init__()
@@ -58,8 +57,8 @@ class SevenNetLAMMPSMLIAPWrapper(MLIAPUnified):
         self.model = None  # lazy init
 
         # calc_kwargs
-        self.use_cueq = kwargs.get('enable_cueq', False)
-        self.use_flash = kwargs.get('enable_flash', False)
+        self.use_cueq = kwargs.get('use_cueq', False)
+        self.use_flash = kwargs.get('use_flash', False)
         self.modal = kwargs.get('modal', None)
 
         # extract configs
@@ -75,9 +74,7 @@ class SevenNetLAMMPSMLIAPWrapper(MLIAPUnified):
                 f'{list(config[KEY.MODAL_MAP].keys())}'
             )
 
-        self.cutoff = kwargs.get('cutoff', None)
-        if self.cutoff is None:
-            self.cutoff = float(config[KEY.CUTOFF])
+        self.cutoff = float(config[KEY.CUTOFF])
         self.rcutfac = self.cutoff * 0.5
 
         # TODO: verify below
