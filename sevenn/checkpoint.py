@@ -312,6 +312,7 @@ class SevenNetCheckpoint:
         *,
         enable_cueq: Optional[bool] = None,
         enable_flash: Optional[bool] = None,
+        enable_oeq: Optional[bool] = None,
         _flash_lammps: bool = False,
     ) -> AtomGraphSequential:
         """
@@ -328,9 +329,13 @@ class SevenNetCheckpoint:
         cp_using_flash = self.config.get(KEY.USE_FLASH_TP, False)
         enable_flash = cp_using_flash if enable_flash is None else enable_flash
 
+        cp_using_oeq = self.config.get(KEY.USE_OEQ, False)
+        enable_oeq = cp_using_oeq if enable_oeq is None else enable_oeq
+
         assert not _flash_lammps or enable_flash
         cfg_new = self.config
         cfg_new['_flash_lammps'] = _flash_lammps
+        cfg_new[KEY.USE_OEQ] = enable_oeq
 
         if (cp_using_cueq, cp_using_flash) == (enable_cueq, enable_flash):
             # backend not given, or checkpoint backend is same as requested
@@ -347,6 +352,7 @@ class SevenNetCheckpoint:
 
             cfg_new[KEY.CUEQUIVARIANCE_CONFIG] = {'use': enable_cueq}
             cfg_new[KEY.USE_FLASH_TP] = enable_flash
+            cfg_new[KEY.USE_OEQ] = enable_oeq
             model = build_E3_equivariant_model(cfg_new)
             stct_src = compat.patch_state_dict_if_old(
                 self.model_state_dict, self.config, model
