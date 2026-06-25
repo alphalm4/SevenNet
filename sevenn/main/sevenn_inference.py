@@ -67,6 +67,13 @@ def add_args(parser):
         help='modality for multi-modal inference',
     )
     ag.add_argument(
+        '--sequence',
+        type=str,
+        default=None,
+        help='path to .npy of int indices to sub-sample .aselmdb targets '
+             '(indices into the sorted-leaf-dir dataset)',
+    )
+    ag.add_argument(
         '-cueq',
         '--enable_cueq',
         help='use cuEquivariance to accelerate inference',
@@ -156,6 +163,7 @@ def run(args):
         enable_cueq=args.enable_cueq,
         enable_flash=args.enable_flash,
         enable_oeq=args.enable_oeq,
+        sequence=args.sequence,
         **fmt_kwargs,
     )
 
