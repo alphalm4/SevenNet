@@ -1,3 +1,4 @@
+import gc
 import math
 import os
 import time
@@ -168,89 +169,153 @@ def processing_by_batch(
         config.get(KEY.SCHEDULER_BATCH_MODE, False)
     )
 
+    # --- periodic DataLoader-worker restart -----------------------------------
+    # Within a single (huge) epoch the persistent_workers mechanism never fires,
+    # so worker memory grows unbounded -> RAM OOM. We instead tear down and
+    # respawn the workers at every checkpoint boundary, resuming the
+    # OrderedSampler at the exact data position from the epoch-start rng state.
+    # The emitted sample order is provably identical to an uninterrupted run
+    # (proof: _proof_sampler_resume.py / _proof_dataloader_restart.py): same
+    # permutation P0 from the same rng state, sliced from `current_data_index`,
+    # so there is no duplication, skipping, or reordering of samples.
+    _lk = config.get(KEY.LOADER_KWARGS, None) or {}
+    effective_num_workers = _lk.get('num_workers', config.get(KEY.NUM_WORKERS, 0))
+    persistent_workers = _lk.get('persistent_workers', False)
+    restart_workers = effective_num_workers > 0 and not persistent_workers
+    if restart_workers:
+        log.writeline(
+            'Periodic worker restart ENABLED: workers respawn every checkpoint '
+            f'(~{save_batch_idx[0] if save_batch_idx else total_step} batches) '
+            'to bound DataLoader RAM. Sample order is identical to a continuous '
+            'run (data integrity preserved).'
+        )
+
     # TODO: too long, refactor more
     log.writeline('Entering training loop')
     for epoch in range(start_epoch, total_epoch + 1):  # one indexing
-        data_progress[KEY.NUMPY_RNG_STATE] = train_loader.sampler.get_rng_state()
+        # rng state captured ONCE at epoch start; every leg resumes from this
+        # so each leg reproduces the same permutation for this epoch.
+        epoch_rng_state = train_loader.sampler.get_rng_state()
+        data_progress[KEY.NUMPY_RNG_STATE] = epoch_rng_state
         log.timer_start('epoch')
         log.timer_start('batch')
 
+        base_batch = start_batch if epoch == start_epoch else 0
+
+        if restart_workers:
+            # one leg per remaining checkpoint interval; each leg ends on a save
+            leg_bounds = [b for b in save_batch_idx if b > base_batch]
+            if not leg_bounds or leg_bounds[-1] < total_step:
+                leg_bounds.append(total_step)
+        else:
+            leg_bounds = [total_step]  # single continuous pass (original behavior)
+
         dl_timing = AverageNumber()
-        dl_end = time.time()
-        for idx, batch in enumerate(train_loader):
-            dl_timing.update(time.time() - dl_end)
-            current_batch_idx = idx + 1
-            if epoch == start_epoch:
-                current_batch_idx += start_batch  # continuing from middle of epoch
-            save = current_batch_idx in save_batch_idx
+        current_batch_idx = base_batch
 
-            if save:
-                lr = trainer.get_lr()
-                log.bar()
-                log.writeline(
-                    f'Epoch {epoch}/{total_epoch}  '
-                    + f'Batch {current_batch_idx}/{total_step}  lr: {lr:8f}'
-                )
-                log.bar()
-
-            trainer.train_one_batch(batch, recorders[train_loader_key])
-            if scheduler_update_every_batch:  # onecyclelr
-                trainer.scheduler_step(best_val)
-
-            if save:
-                csv_dct = {
-                    'epoch': str(epoch),
-                    'batch': str(current_batch_idx),
-                    'lr': f'{trainer.get_lr():8f}',
-                }
-                errors = {}
-                for k, loader in loaders.items():
-                    rec = recorders[k]
-                    if k != train_loader_key:
-                        print('valid', k, flush=True)
-                        trainer.run_one_epoch(loader, False, rec)
-                    if trainer.distributed:
-                        trainer.recorder_all_reduce(rec)
-                    csv_dct.update(rec.get_dct(prefix=k))
-                    errors[k] = rec.epoch_forward()
-                log.write_full_table(list(errors.values()), list(errors))
-
-                batch_name = (
-                    f'_{save_batch_idx.index(current_batch_idx) + 1}'
-                    if current_batch_idx != save_batch_idx[-1]
-                    else ''
-                )
-                data_progress[KEY.CURRENT_DATA_IDX] = min(
+        for leg_end in leg_bounds:
+            if current_batch_idx >= leg_end:
+                continue
+            if restart_workers:
+                # respawn fresh workers and resume sampler at the exact position
+                consumed = min(
                     current_batch_idx * effective_batch_size,
                     data_progress[KEY.TOTAL_DATA_NUM],
                 )
-                trainer.write_checkpoint(
-                    f'{prefix}/checkpoint_{epoch}{batch_name}.pth',
-                    config=config,
-                    epoch=epoch,
-                    data_progress=data_progress,
+                train_loader.sampler.continue_from_data_progress(
+                    numpy_rng_state=epoch_rng_state,
+                    total_data_num=data_progress[KEY.TOTAL_DATA_NUM],
+                    current_data_index=consumed,
                 )
-
-                if write_csv:
-                    with open(csv_path, 'a') as f:
-                        f.write(','.join(list(csv_dct.values())) + '\n')
-
-                if best_key and errors[best_metric_loader_key][best_key] < best_val:
-                    trainer.write_checkpoint(
-                        f'{prefix}/checkpoint_best.pth', config=config, epoch=epoch
-                    )
-                    best_val = errors[best_metric_loader_key][best_key]
-                    log.writeline('Best checkpoint written')
-
-                log.timer_end('batch', message=f'Batch {current_batch_idx} elapsed')
-                if config[KEY.IS_DDP]:
-                    dl_timing._ddp_reduce(trainer.device)
-                log.writeline(f'data loading, per (sec): {dl_timing.get():.4f}')
-                log.writeline(f'data loading, sum *ALL* (sec): {dl_timing._sum:.4f}')
-                dl_timing = AverageNumber()
-                log.timer_start('batch')
+            loader_iter = iter(train_loader)  # spawns worker processes
             dl_end = time.time()
-            # batch loop indent
+            while current_batch_idx < leg_end:
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    break
+                dl_timing.update(time.time() - dl_end)
+                current_batch_idx += 1
+                save = current_batch_idx in save_batch_idx
+
+                if save:
+                    lr = trainer.get_lr()
+                    log.bar()
+                    log.writeline(
+                        f'Epoch {epoch}/{total_epoch}  '
+                        + f'Batch {current_batch_idx}/{total_step}  lr: {lr:8f}'
+                    )
+                    log.bar()
+
+                trainer.train_one_batch(batch, recorders[train_loader_key])
+                if scheduler_update_every_batch:  # onecyclelr
+                    trainer.scheduler_step(best_val)
+
+                if save:
+                    csv_dct = {
+                        'epoch': str(epoch),
+                        'batch': str(current_batch_idx),
+                        'lr': f'{trainer.get_lr():8f}',
+                    }
+                    errors = {}
+                    for k, loader in loaders.items():
+                        rec = recorders[k]
+                        if k != train_loader_key:
+                            print('valid', k, flush=True)
+                            trainer.run_one_epoch(loader, False, rec)
+                        if trainer.distributed:
+                            trainer.recorder_all_reduce(rec)
+                        csv_dct.update(rec.get_dct(prefix=k))
+                        errors[k] = rec.epoch_forward()
+                    log.write_full_table(list(errors.values()), list(errors))
+
+                    batch_name = (
+                        f'_{save_batch_idx.index(current_batch_idx) + 1}'
+                        if current_batch_idx != save_batch_idx[-1]
+                        else ''
+                    )
+                    data_progress[KEY.CURRENT_DATA_IDX] = min(
+                        current_batch_idx * effective_batch_size,
+                        data_progress[KEY.TOTAL_DATA_NUM],
+                    )
+                    trainer.write_checkpoint(
+                        f'{prefix}/checkpoint_{epoch}{batch_name}.pth',
+                        config=config,
+                        epoch=epoch,
+                        data_progress=data_progress,
+                    )
+
+                    if write_csv:
+                        with open(csv_path, 'a') as f:
+                            f.write(','.join(list(csv_dct.values())) + '\n')
+
+                    if best_key and errors[best_metric_loader_key][best_key] < best_val:
+                        trainer.write_checkpoint(
+                            f'{prefix}/checkpoint_best.pth', config=config, epoch=epoch
+                        )
+                        best_val = errors[best_metric_loader_key][best_key]
+                        log.writeline('Best checkpoint written')
+
+                    log.timer_end(
+                        'batch', message=f'Batch {current_batch_idx} elapsed'
+                    )
+                    if config[KEY.IS_DDP]:
+                        dl_timing._ddp_reduce(trainer.device)
+                    log.writeline(f'data loading, per (sec): {dl_timing.get():.4f}')
+                    log.writeline(
+                        f'data loading, sum *ALL* (sec): {dl_timing._sum:.4f}'
+                    )
+                    dl_timing = AverageNumber()
+                    log.timer_start('batch')
+                dl_end = time.time()
+                # batch loop indent
+            # leg finished: drop the iterator so the worker processes shut down
+            # and release their accumulated memory before the next leg respawns
+            # fresh ones. (no-op effect on data order: next leg resumes the
+            # sampler at current_batch_idx from epoch_rng_state.)
+            del loader_iter
+            if restart_workers:
+                gc.collect()
 
         if not scheduler_update_every_batch:
             trainer.scheduler_step(best_val)
