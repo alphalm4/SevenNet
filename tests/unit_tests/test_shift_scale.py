@@ -3,6 +3,7 @@ import torch
 
 import sevenn._keys as KEY
 from sevenn._const import NUM_UNIV_ELEMENT, AtomGraphDataType
+from sevenn.model_build import init_shift_scale
 from sevenn.nn.scale import (
     ModalWiseRescale,
     Rescale,
@@ -55,6 +56,57 @@ def test_rescale_get_shift_and_scale():
     module = Rescale(shift=1.5, scale=3.5)
     assert module.get_shift() == pytest.approx(1.5)
     assert module.get_scale() == pytest.approx(3.5)
+
+
+def test_init_shift_scale_can_store_shift_scale_as_float64():
+    config = {
+        KEY.SHIFT: 1.0,
+        KEY.SCALE: 2.0,
+        KEY.TRAIN_SHIFT: True,
+        KEY.TRAIN_SCALE: False,
+        KEY.TYPE_MAP: {1: 0},
+        KEY.USE_MODALITY: False,
+        KEY.SHIFT_SCALE_DTYPE: 'float64',
+    }
+
+    module = init_shift_scale(config)
+
+    assert module.shift.dtype is torch.float64
+    assert module.scale.dtype is torch.float64
+    assert module.shift.requires_grad
+    assert not module.scale.requires_grad
+
+
+def test_modalwise_rescale_float64_keeps_output_and_gradient_float64():
+    module = ModalWiseRescale(
+        shift=[[1.0, 2.0]],
+        scale=[[3.0, 4.0]],
+        data_key_in='in',
+        data_key_out='out',
+        data_key_modal_indices='modal_idx',
+        data_key_atom_indices='atom_idx',
+        use_modal_wise_shift=True,
+        use_modal_wise_scale=True,
+        train_shift=True,
+        train_scale=False,
+        shift_scale_dtype=torch.float64,
+    )
+    input_data = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+    data: AtomGraphDataType = {
+        'in': input_data,
+        'modal_idx': torch.tensor([0], dtype=torch.long),
+        'atom_idx': torch.tensor([0, 1], dtype=torch.long),
+        'batch': torch.tensor([0, 0], dtype=torch.long),
+    }
+
+    out = module(data)['out']
+    out.sum().backward()
+
+    assert module.shift.dtype is torch.float64
+    assert module.scale.dtype is torch.float64
+    assert out.dtype is torch.float64
+    assert module.shift.grad is not None
+    assert module.shift.grad.dtype is torch.float64
 
 
 ################################################################################

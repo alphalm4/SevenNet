@@ -8,6 +8,18 @@ import sevenn._keys as KEY
 from sevenn._const import NUM_UNIV_ELEMENT, AtomGraphDataType
 
 
+def _resolve_shift_scale_dtype(dtype: Any) -> torch.dtype:
+    if dtype in (torch.float32, torch.float):
+        return torch.float32
+    if dtype in (torch.float64, torch.double):
+        return torch.float64
+    if dtype in ('float32', 'float', 'single'):
+        return torch.float32
+    if dtype in ('float64', 'double'):
+        return torch.float64
+    raise ValueError(f'Unsupported shift/scale dtype: {dtype}')
+
+
 def _as_univ(
     ss: List[float], type_map: Dict[int, int], default: float
 ) -> List[float]:
@@ -33,6 +45,7 @@ class Rescale(nn.Module):
         train_shift: bool = False,
         train_scale: bool = False,
         train_shift_scale: bool = False,
+        shift_scale_dtype: Any = torch.float32,
         **kwargs,
     ) -> None:
         assert isinstance(shift, float) and isinstance(scale, float)
@@ -40,11 +53,12 @@ class Rescale(nn.Module):
         if train_shift_scale:
             train_shift = True
             train_scale = True
+        dtype = _resolve_shift_scale_dtype(shift_scale_dtype)
         self.shift = nn.Parameter(
-            torch.FloatTensor([shift]), requires_grad=train_shift
+            torch.tensor([shift], dtype=dtype), requires_grad=train_shift
         )
         self.scale = nn.Parameter(
-            torch.FloatTensor([scale]), requires_grad=train_scale
+            torch.tensor([scale], dtype=dtype), requires_grad=train_scale
         )
         self.key_input = data_key_in
         self.key_output = data_key_out
@@ -79,11 +93,13 @@ class SpeciesWiseRescale(nn.Module):
         train_shift: bool = False,
         train_scale: bool = False,
         train_shift_scale: bool = False,
+        shift_scale_dtype: Any = torch.float32,
     ) -> None:
         super().__init__()
         if train_shift_scale:
             train_shift = True
             train_scale = True
+        dtype = _resolve_shift_scale_dtype(shift_scale_dtype)
         assert isinstance(shift, float) or isinstance(shift, list)
         assert isinstance(scale, float) or isinstance(scale, list)
 
@@ -105,10 +121,10 @@ class SpeciesWiseRescale(nn.Module):
         scale = [scale] * num_species if isinstance(scale, float) else scale
 
         self.shift = nn.Parameter(
-            torch.FloatTensor(shift), requires_grad=train_shift
+            torch.tensor(shift, dtype=dtype), requires_grad=train_shift
         )
         self.scale = nn.Parameter(
-            torch.FloatTensor(scale), requires_grad=train_scale
+            torch.tensor(scale, dtype=dtype), requires_grad=train_scale
         )
         self.key_input = data_key_in
         self.key_output = data_key_out
@@ -193,16 +209,18 @@ class ModalWiseRescale(nn.Module):
         train_shift: bool = False,
         train_scale: bool = False,
         train_shift_scale: bool = False,
+        shift_scale_dtype: Any = torch.float32,
     ) -> None:
         super().__init__()
         if train_shift_scale:
             train_shift = True
             train_scale = True
+        dtype = _resolve_shift_scale_dtype(shift_scale_dtype)
         self.shift = nn.Parameter(
-            torch.FloatTensor(shift), requires_grad=train_shift
+            torch.tensor(shift, dtype=dtype), requires_grad=train_shift
         )
         self.scale = nn.Parameter(
-            torch.FloatTensor(scale), requires_grad=train_scale
+            torch.tensor(scale, dtype=dtype), requires_grad=train_scale
         )
         self.key_input = data_key_in
         self.key_output = data_key_out
