@@ -50,6 +50,128 @@ try:
                 yield O3_e3nn(l=l, p=1 * (-1) ** l)
                 yield O3_e3nn(l=l, p=-1 * (-1) ** l)
 
+    class CueqFCTPLinear(torch.nn.Module):
+        """Collapsed FCTP for a one-hot scalar second operand."""
+
+        def __init__(
+            self,
+            irreps_in1: cue.Irreps,
+            irreps_in2: cue.Irreps,
+            irreps_out: cue.Irreps,
+            *,
+            shared_weights: bool = True,
+            internal_weights: Union[bool, None] = None,
+            method: str = 'indexed_linear',
+            **kwargs,
+        ) -> None:
+            super().__init__()
+
+            if not shared_weights or internal_weights is False:
+                raise ValueError('CueqFCTPLinear requires shared internal weights')
+            if method != 'indexed_linear':
+                raise ValueError('CueqFCTPLinear requires method="indexed_linear"')
+            if len(irreps_in2) != 1:
+                raise ValueError('The second operand must contain one scalar irrep')
+
+            num_elements, operand_irrep = irreps_in2[0]
+            if operand_irrep.l != 0 or getattr(operand_irrep, 'p', 1) != 1:
+                raise ValueError('The second operand must be an even scalar irrep')
+
+            in_irreps = [ir for _, ir in irreps_in1]
+            out_irreps = [ir for _, ir in irreps_out]
+            if any(ir in in_irreps[:i] for i, ir in enumerate(in_irreps)):
+                raise ValueError('Repeated input irreps are not supported')
+            if any(ir in out_irreps[:i] for i, ir in enumerate(out_irreps)):
+                raise ValueError('Repeated output irreps are not supported')
+
+            self.num_elements = int(num_elements)
+            self.irreps_out_dim = irreps_out.dim
+            output_mask = [ir in in_irreps for _, ir in irreps_out]
+            self.output_segments = [
+                (keep, int(mul * ir.dim))
+                for keep, (mul, ir) in zip(output_mask, irreps_out)
+            ]
+            linear_irreps_out = irreps_out.filter(mask=output_mask)
+            self.path_shapes = [
+                (int(mul_in), self.num_elements, int(mul_out))
+                for mul_in, ir_in in irreps_in1
+                for mul_out, ir_out in irreps_out
+                if ir_in == ir_out
+            ]
+            self.weight_numel = sum(
+                mul_in * num_elem * mul_out
+                for mul_in, num_elem, mul_out in self.path_shapes
+            )
+            linear_weight_numel = sum(
+                mul_in * mul_out
+                for mul_in, _, mul_out in self.path_shapes
+            )
+
+            device = kwargs.get('device')
+            dtype = kwargs.get('dtype')
+            self.weight = torch.nn.Parameter(
+                torch.randn(self.weight_numel, device=device, dtype=dtype)
+            )
+
+            self.linear = None
+            if linear_weight_numel > 0:
+                self.linear = cuet.Linear(
+                    irreps_in1,
+                    linear_irreps_out,
+                    shared_weights=True,
+                    internal_weights=False,
+                    weight_classes=self.num_elements,
+                    method=method,
+                    **kwargs,
+                )
+                if self.linear.weight_numel != linear_weight_numel:
+                    raise ValueError('Unexpected cuEquivariance linear path layout')
+
+        def _pack_weights(self) -> torch.Tensor:
+            blocks = []
+            offset = 0
+            for mul_in, num_elements, mul_out in self.path_shapes:
+                size = mul_in * num_elements * mul_out
+                block = self.weight[offset : offset + size].reshape(
+                    mul_in, num_elements, mul_out
+                )
+                blocks.append(block.permute(1, 0, 2).reshape(num_elements, -1))
+                offset += size
+
+            if not blocks:
+                return self.weight.new_empty((self.num_elements, 0))
+            return torch.cat(blocks, dim=1) / self.num_elements**0.5
+
+        def forward(self, x: torch.Tensor, operand: torch.Tensor) -> torch.Tensor:
+            if operand.ndim != 2 or operand.shape[1] != self.num_elements:
+                raise ValueError('Operand shape must be [num_atoms, num_elements]')
+            if x.shape[0] != operand.shape[0]:
+                raise ValueError('Input and operand atom counts must match')
+            if self.linear is None or x.shape[0] == 0:
+                zero = x.sum(dim=1, keepdim=True) * 0.0 + self.weight.sum() * 0.0
+                return zero.expand(x.shape[0], self.irreps_out_dim)
+
+            indices = torch.argmax(operand, dim=1)
+            order = torch.argsort(indices, stable=True)
+            inverse_order = torch.argsort(order)
+            output = self.linear(
+                x.index_select(0, order),
+                self._pack_weights(),
+                indices.index_select(0, order),
+            )
+            output = output.index_select(0, inverse_order)
+
+            output_blocks = []
+            offset = 0
+            zero = x.sum(dim=1, keepdim=True) * 0.0
+            for keep, dim in self.output_segments:
+                if keep:
+                    output_blocks.append(output[:, offset : offset + dim])
+                    offset += dim
+                else:
+                    output_blocks.append(zero.expand(x.shape[0], dim))
+            return torch.cat(output_blocks, dim=1)
+
     class cueq_fused_scatter_channelwise_conv(torch.nn.Module):
         def __init__(
             self,
@@ -269,6 +391,9 @@ def patch_fully_connected(
         module.fc_tensor_product_kwargs, may_not_compatible_default
     )
 
-    module.fc_tensor_product_cls = cuet.FullyConnectedTensorProduct  # type: ignore
-    module.fc_tensor_product_kwargs.update(**cue_kwargs)
+    module.fc_tensor_product_cls = CueqFCTPLinear  # type: ignore
+    module.fc_tensor_product_kwargs.update(
+        method='indexed_linear',
+        **cue_kwargs,
+    )
     return module

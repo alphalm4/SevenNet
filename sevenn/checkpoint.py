@@ -166,7 +166,10 @@ def _convert_e3nn_and_cueq(stct_src, stct_dst, src_config, from_cueq):
     ]
     ignores_in_conv = cue_only_conv_followers + e3nn_only_conv_followers
 
-    cue_only_fc_followers = ['fc_tensor_product.f.tp.f_fx.module.c']
+    cue_only_fc_followers = [
+        'fc_tensor_product.f.tp.f_fx.module.c',
+        'fc_tensor_product.linear.',
+    ]
     e3nn_only_fc_followers = [
         'fc_tensor_product.output_mask',
     ]

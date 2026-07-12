@@ -289,13 +289,13 @@ def patch_cue(layers: OrderedDict, config: Dict[str, Any]) -> OrderedDict:
             updates[k] = module_patched
             """
         elif isinstance(module, SelfConnectionIntro):
-            continue
-            """
+            # Preserve the upstream cueq path unless the debug fast path is explicit.
+            if os.getenv('SEVENNET_ENABLE_CUEQ_FCTP_LINEAR') != '1':
+                continue
             module_patched = cue_helper.patch_fully_connected(
                 module, group, **cueq_patch_kwargs
             )
             updates[k] = module_patched
-            """
         elif isinstance(module, IrrepsConvolution):
             module_patched = cue_helper.patch_convolution(
                 module,
