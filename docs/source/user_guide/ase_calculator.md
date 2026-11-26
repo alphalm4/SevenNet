@@ -17,7 +17,8 @@ For the method, units, supported functionals/damping types, and limitations, see
 
 ### `SevenNetD3Calculator` (SevenNet + D3)
 
-It sums a `SevenNetCalculator` and a `D3Calculator`, returning combined energy, forces, and stress.
+It adds a D3 correction to `SevenNetCalculator` and returns combined energy,
+forces, and stress.
 
 ```python
 # To obtain 7net-0 + D3(BJ) results
@@ -32,9 +33,37 @@ calc = SevenNetD3Calculator(
 
 It accepts every `SevenNetCalculator` argument (`model`, `modal`, `enable_cueq`/`enable_flash`/`enable_oeq`, ...) plus the D3 parameters listed below.
 
+#### CUDA-Dispersion backend
+
+Install with `python -m pip install 'sevenn[cudadisp]'` and select the backend
+with `d3_backend='cuda-dispersion'`:
+
+```python
+from sevenn.calculator import SevenNetD3Calculator
+
+calc = SevenNetD3Calculator(
+    model='7net-0', device='cuda', d3_backend='cuda-dispersion'
+)
+```
+
+CUDA-Dispersion requires Linux, Python 3.10 or later, and an NVIDIA GPU with
+compute capability 8.0 or later. When building from source on a cluster, load
+its CUDA toolkit and set `CUDA_ARCHS` for the target GPU. For example, on an
+A100, run the following from a SevenNet checkout:
+
+```bash
+CUDA_ARCHS=sm_80 NVCC="$(command -v nvcc)" \
+    python -m pip install --no-binary=cuda-dispersion '.[cudadisp]'
+```
+
+The same D3 functional, damping, and cutoff arguments apply. The dispersion
+stress is `NaN` for structures without full periodicity. See the
+[CUDA-Dispersion documentation](https://github.com/alphalm4/CUDA-Dispersion)
+for its CUDA toolkit requirements and dispersion options.
+
 ### `D3Calculator` (D3 only)
 
-`D3Calculator` computes only the D3 dispersion term. Use it directly when you want the dispersion contribution on its own, or combine it with another calculator via ASE's `SumCalculator` (this is exactly what `SevenNetD3Calculator` does internally):
+`D3Calculator` computes only the D3 dispersion term. Use it directly when you want the dispersion contribution on its own, or combine it with another calculator via ASE's `SumCalculator` as the built-in backend does:
 
 ```python
 from ase.calculators.mixing import SumCalculator
@@ -57,7 +86,8 @@ Both calculators share the same D3 knobs:
 See {doc}`./d3` for the full explanation of each option and the list of supported functionals.
 
 :::{caution}
-The D3 calculators require a CUDA GPU (compute capability ≥ 6.0); CPU + D3 is not supported. There is also a hard limit of 46,340 atoms per call. See the Cautions section of {doc}`./d3`.
+The built-in D3 backend requires a CUDA GPU with compute capability ≥ 6.0
+and supports up to 46,340 atoms per call. See the Cautions section of {doc}`./d3`.
 :::
 
 ## Accelerating inference

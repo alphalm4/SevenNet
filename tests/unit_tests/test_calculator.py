@@ -1,4 +1,5 @@
 import copy
+import sys
 
 import numpy as np
 import pytest
@@ -8,7 +9,12 @@ from ase.build import bulk, molecule
 
 import sevenn._keys as KEY
 from sevenn.atom_graph_data import AtomGraphData
-from sevenn.calculator import D3Calculator, SevenNetCalculator, _sort_edges
+from sevenn.calculator import (
+    D3Calculator,
+    SevenNetCalculator,
+    SevenNetD3Calculator,
+    _sort_edges,
+)
 from sevenn.nn.cue_helper import is_cue_available
 from sevenn.nn.flash_helper import is_flash_available
 from sevenn.train.dataload import unlabeled_atoms_to_graph
@@ -230,6 +236,41 @@ def test_sevennet_0_cal_flash(atoms_pbc, sevennet_0_flash_cal):
     assert np.allclose(atoms_pbc.get_forces(), atoms1_ref['force'])
     assert np.allclose(atoms_pbc.get_stress(), atoms1_ref['stress'])
     assert np.allclose(atoms_pbc.get_potential_energies(), atoms1_ref['energies'])
+
+
+def test_sevennet_d3_cudadisp_missing_dependency(monkeypatch):
+    monkeypatch.setitem(sys.modules, 'cuda_d3', None)
+
+    with pytest.raises(ImportError, match=r'sevenn\[cudadisp\]'):
+        SevenNetD3Calculator(d3_backend='cuda-dispersion')
+
+
+def test_sevennet_d3_cudadisp(atoms_pbc):
+    cuda_d3 = pytest.importorskip('cuda_d3')
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip('CUDA-Dispersion requires a GPU with compute capability 8.0+')
+
+    model_options = dict(device='cuda', cuda_graph=False, radial_table=False)
+    combined = SevenNetD3Calculator(
+        d3_backend='cuda-dispersion',
+        functional_name='PBE',
+        damping_type='damp_zero',
+        vdw_cutoff=1200,
+        cn_cutoff=400,
+        **model_options,
+    )
+    sevennet = SevenNetCalculator(**model_options)
+    dispersion = cuda_d3.CudaD3Calculator(
+        functional='pbe', damping='damp_zero', vdw_cutoff=1200, cn_cutoff=400
+    )
+
+    for prop in ('energy', 'free_energy', 'forces', 'stress'):
+        expected = sevennet.get_property(prop, atoms_pbc) + dispersion.get_property(
+            prop, atoms_pbc
+        )
+        np.testing.assert_allclose(
+            combined.get_property(prop, atoms_pbc), expected, rtol=1e-5, atol=1e-6
+        )
 
 
 def test_d3_cal_pbc(atoms_pbc, d3_cal):

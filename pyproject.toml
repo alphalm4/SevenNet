@@ -49,6 +49,7 @@ cueq13 = [
 ]
 oeq = ["openequivariance"]
 lunatp = ["LunaEquivariance==0.3.0"]
+cudadisp = ["cuda-dispersion[ase]>=0.1.0; python_version >= '3.10' and sys_platform == 'linux'"]
 mliap12 = ["cython==3.0.11", "cupy-cuda12x"]
 mliap13 = ["cython==3.0.11", "cupy-cuda13x"]
 

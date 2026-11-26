@@ -788,6 +788,7 @@ class SevenNetD3Calculator(SumCalculator):
         radial_table: Optional[bool] = None,
         radial_knots: int = DEFAULT_RADIAL_TABLE_KNOTS,
         radial_r_min: float = DEFAULT_RADIAL_TABLE_R_MIN,
+        d3_backend: str = 'builtin',
         **kwargs,  # pass extra kwargs to both calculators
     ) -> None:
         """Initialize SevenNetD3Calculator. CUDA required.
@@ -827,6 +828,8 @@ class SevenNetD3Calculator(SumCalculator):
             cn cutoff of D3 calculator in au^2
         fused, cuda_graph, radial_table, radial_knots, radial_r_min
             Acceleration options passed to SevenNetCalculator.
+        d3_backend: str, default='builtin'
+            Use 'cuda-dispersion' to select the optional CUDA-Dispersion backend.
         """
         if kwargs.get('compute_atomic_virial', False):
             warnings.warn(
@@ -835,13 +838,36 @@ class SevenNetD3Calculator(SumCalculator):
                 'include D3 contributions.'
             )
 
-        d3_calc = D3Calculator(
-            damping_type=damping_type,
-            functional_name=functional_name,
-            vdw_cutoff=vdw_cutoff,
-            cn_cutoff=cn_cutoff,
-            **kwargs,
-        )
+        d3_options = dict(kwargs, vdw_cutoff=vdw_cutoff, cn_cutoff=cn_cutoff)
+        if d3_backend == 'builtin':
+            d3_calc = D3Calculator(
+                damping_type=damping_type,
+                functional_name=functional_name,
+                **d3_options,
+            )
+        elif d3_backend == 'cuda-dispersion':
+            try:
+                from cuda_d3 import CudaD3Calculator
+            except ModuleNotFoundError as exc:
+                if exc.name != 'cuda_d3':
+                    raise
+                raise ImportError(
+                    'Install the CUDA-Dispersion backend with '
+                    '`pip install "sevenn[cudadisp]"`.'
+                ) from exc
+
+            if not torch.cuda.is_available():
+                raise NotImplementedError('CUDA-Dispersion requires a CUDA GPU.')
+
+            d3_device = torch.device('cuda' if device == 'auto' else device)
+            with torch.cuda.device(d3_device if d3_device.type == 'cuda' else None):
+                d3_calc = CudaD3Calculator(
+                    damping=damping_type.lower(),
+                    functional=functional_name.lower(),
+                    **d3_options,
+                )
+        else:
+            raise ValueError(f'Unknown D3 backend: {d3_backend!r}')
 
         sevennet_calc = SevenNetCalculator(
             model=model,
