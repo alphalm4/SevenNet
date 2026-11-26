@@ -6,6 +6,7 @@ import pytest
 import torch
 from ase import Atoms
 from ase.build import bulk, molecule
+from ase.calculators.calculator import PropertyNotImplementedError
 
 import sevenn._keys as KEY
 from sevenn.atom_graph_data import AtomGraphData
@@ -13,6 +14,7 @@ from sevenn.calculator import (
     D3Calculator,
     SevenNetCalculator,
     SevenNetD3Calculator,
+    SevenNetD4Calculator,
     _sort_edges,
 )
 from sevenn.nn.cue_helper import is_cue_available
@@ -281,6 +283,38 @@ def test_sevennet_d3_cudadisp(atoms_pbc, cuda_graph):
         atoms_pbc.positions[0, 0] += 0.001
     if cuda_graph:
         assert combined._gpu_calc._n_replays > 0
+
+
+@pytest.mark.parametrize('periodic', [True, False])
+def test_sevennet_d4_cudadisp(atoms_pbc, atoms_mol, periodic):
+    cuda_d4 = pytest.importorskip('cuda_d4')
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip('CUDA-Dispersion requires a GPU with compute capability 8.0+')
+
+    atoms = atoms_pbc if periodic else atoms_mol
+    charge = None if periodic else -1.0
+    model_options = {'device': 'cuda', 'cuda_graph': periodic, 'radial_table': False}
+    combined = SevenNetD4Calculator(charge=charge, **model_options)
+    sevennet = SevenNetCalculator(**model_options)
+    dispersion = cuda_d4.CudaD4()
+
+    for initial_charge in (0.0, 1.0, 0.5):
+        atoms.set_initial_charges([initial_charge / len(atoms)] * len(atoms))
+        d4_result = dispersion.compute(
+            atoms, charge=initial_charge if charge is None else charge
+        )
+        for prop in ('energy', 'free_energy', 'forces', 'stress'):
+            baseline = sevennet.get_property(prop, atoms)
+            correction = d4_result['energy' if prop == 'free_energy' else prop]
+            np.testing.assert_allclose(
+                combined.get_property(prop, atoms), baseline + correction,
+                rtol=1e-5, atol=1e-6,
+            )
+        assert 'energies' not in combined.results
+    with pytest.raises(PropertyNotImplementedError):
+        combined.get_property('energies', atoms)
+    if periodic:
+        assert combined._n_replays > 0
 
 
 def test_d3_cal_pbc(atoms_pbc, d3_cal):

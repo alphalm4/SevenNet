@@ -92,6 +92,28 @@ The built-in D3 backend requires a CUDA GPU with compute capability ≥ 6.0
 and supports up to 46,340 atoms per call. See the Cautions section of {doc}`./d3`.
 :::
 
+## D4 dispersion correction
+
+Install `sevenn[cudadisp]` to run SevenNet with charge-dependent CUDA D4.
+
+```python
+from sevenn.calculator import SevenNetD4Calculator
+
+calc = SevenNetD4Calculator(model='7net-0', functional_name='pbe')
+atoms.calc = calc
+```
+
+D4 supports molecules and structures with three-dimensional periodicity. The
+calculator returns total energy, forces, and stress where defined. Combined
+per-atom energies and stresses are unavailable. SevenNet and D4 share the
+uploaded positions and combine the results on the GPU before returning them to
+ASE.
+
+Set `charge` in units of the elementary charge to override the structure's
+total charge. By default, the calculator sums the ASE initial charges, which
+are zero for atoms without specified charges. Pass `d4_options` to set the
+[CUDA D4 cutoffs](https://github.com/alphalm4/CUDA-Dispersion/tree/main/d4).
+
 ## Accelerating inference
 
 Select one tensor-product backend with `enable_cueq`, `enable_flash`,

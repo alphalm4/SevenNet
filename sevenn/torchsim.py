@@ -25,7 +25,7 @@ except ImportError as exc:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, Sequence
 
     from sevenn.nn.sequential import AtomGraphSequential
 
@@ -53,6 +53,49 @@ def _validate(model: AtomGraphSequential, modal: str) -> None:
             f'modal={modal} is ignored as model has no modal_map',
             stacklevel=2,
         )
+
+
+def _cuda_dispersion_device(
+    device: torch.device | str, feature: str
+) -> torch.device:
+    device = torch.device('cuda' if device == 'auto' else device)
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        raise ValueError(f'{feature} requires a CUDA device')
+    if device.index is None:
+        return torch.device('cuda', torch.cuda.current_device())
+    return device
+
+
+def _dispersion_batch(
+    state: ts.SimState,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cells = state.row_vector_cell
+    pbc = state.pbc.expand(cells.shape[0], 3)
+    systems = torch.arange(
+        cells.shape[0] + 1, device=state.device, dtype=state.system_idx.dtype
+    )
+    # TorchSim groups atoms by system. The cell count fixes the output shape.
+    sizes = torch.searchsorted(state.system_idx, systems).diff()
+    return sizes, cells, pbc
+
+
+def _add_dispersion(
+    results: dict[str, torch.Tensor],
+    correction: dict[str, torch.Tensor],
+    cells: torch.Tensor,
+    periodic: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    volumes = torch.linalg.det(cells.detach()).abs()[:, None, None]
+    valid = volumes > 0
+    if periodic is not None:
+        valid = valid & periodic[:, None, None]
+    stress = -correction['virial'] / volumes.masked_fill(~valid, 1.0)
+    correction['stress'] = stress.masked_fill(~valid, 0.0)
+    return {
+        name: result + correction[name].to(result.dtype)
+        if name in correction else result
+        for name, result in results.items()
+    }
 
 
 class SevenNetModel(ModelInterface):  # type: ignore[misc,valid-type]
@@ -346,13 +389,7 @@ class SevenNetD3Model(ModelInterface):
         if d3_backend not in ('builtin', 'cuda-dispersion'):
             raise ValueError(f'Unknown D3 backend: {d3_backend!r}')
         if d3_backend == 'cuda-dispersion':
-            device = torch.device('cuda' if device == 'auto' else device)
-            if device.type != 'cuda' or not torch.cuda.is_available():
-                raise ValueError(
-                    "d3_backend='cuda-dispersion' requires a CUDA device"
-                )
-            if device.index is None:
-                device = torch.device('cuda', torch.cuda.current_device())
+            device = _cuda_dispersion_device(device, "d3_backend='cuda-dispersion'")
 
         self.sevennet = SevenNetModel(
             model,
@@ -467,13 +504,7 @@ class SevenNetD3Model(ModelInterface):
         use_batch: bool,
     ) -> dict[str, torch.Tensor]:
         d3 = self._get_cuda_d3()
-        cells = state.row_vector_cell
-        pbc = state.pbc.expand(cells.shape[0], 3)
-        systems = torch.arange(
-            cells.shape[0] + 1, device=state.device, dtype=state.system_idx.dtype
-        )
-        # TorchSim groups atoms by system. The cell count fixes the output shape.
-        sizes = torch.searchsorted(state.system_idx, systems).diff()
+        sizes, cells, pbc = _dispersion_batch(state)
         if use_batch:
             correction = d3.compute_batch_packed(
                 state.positions, state.atomic_numbers, sizes, cells, pbc
@@ -495,17 +526,8 @@ class SevenNetD3Model(ModelInterface):
                 'virial': torch.stack([r['virial'] for r in corrections]),
             }
 
-        volumes = torch.linalg.det(cells.detach()).abs()[:, None, None]
-        valid = volumes > 0
-        if not use_batch:
-            valid = valid & pbc.any(dim=-1)[:, None, None]
-        stress = -correction['virial'] / volumes.masked_fill(~valid, 1.0)
-        correction['stress'] = stress.masked_fill(~valid, 0.0)
-        return {
-            name: result + correction[name].to(result.dtype)
-            if name in correction else result
-            for name, result in results.items()
-        }
+        periodic = None if use_batch else pbc.any(dim=-1)
+        return _add_dispersion(results, correction, cells, periodic)
 
     def _apply_serial_d3(
         self, results: dict[str, torch.Tensor], state: ts.SimState,
@@ -583,6 +605,84 @@ class SevenNetD3Model(ModelInterface):
         results['stress'] += torch.from_numpy(
             np.ascontiguousarray(d3_stress_intensive),
         ).to(device=self._device, dtype=self._dtype)
+
+
+class SevenNetD4Model(SevenNetModel):
+    """SevenNet with D4 dispersion from CUDA-Dispersion.
+
+    Pass ``charge`` in e to set a common total charge. Per-system
+    ``state.system_extras['total_charge']`` or explicit ``charges`` in a
+    model call take precedence. The default is neutral systems.
+    """
+
+    def __init__(
+        self,
+        model: AtomGraphSequential | str | Path,
+        *,
+        functional_name: str = 'pbe',
+        ewald: str = 'converged',
+        charge: float | None = None,
+        d4_options: Mapping[str, float] | None = None,
+        device: torch.device | str = 'auto',
+        **kwargs,
+    ) -> None:
+        device = _cuda_dispersion_device(device, 'SevenNetD4Model')
+        super().__init__(model, device=device, **kwargs)
+        self.charge = charge
+        self._d4_functional = functional_name
+        self._d4_ewald = ewald
+        self._d4_options = dict(d4_options or {})
+        self._cuda_d4 = None
+
+    def _get_cuda_d4(self):
+        if self._cuda_d4 is None:
+            try:
+                from cuda_d4.torch_api import CudaD4Torch
+            except ModuleNotFoundError as exc:
+                if exc.name not in ('cuda_d4', 'cuda_d4.torch_api'):
+                    raise
+                raise ImportError(
+                    'Install the CUDA-Dispersion backend with '
+                    '`pip install "sevenn[cudadisp]"`.'
+                ) from exc
+
+            if not hasattr(CudaD4Torch, 'compute_batch_packed'):
+                raise ImportError(
+                    'TorchSim D4 requires CUDA-Dispersion with the packed CUDA API.'
+                )
+            with torch.cuda.device(self.device):
+                self._cuda_d4 = CudaD4Torch(
+                    self._d4_functional, self._d4_ewald, **self._d4_options
+                )
+        return self._cuda_d4
+
+    def forward(
+        self,
+        state: ts.SimState,
+        *,
+        charges: torch.Tensor | Sequence[float] | None = None,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        if state.device != self.device:
+            state = state.to(self.device)
+        results = super().forward(state, **kwargs)
+        return self._apply_cuda_d4(results, state, charges)
+
+    def _apply_cuda_d4(
+        self,
+        results: dict[str, torch.Tensor],
+        state: ts.SimState,
+        charges: torch.Tensor | Sequence[float] | None,
+    ) -> dict[str, torch.Tensor]:
+        sizes, cells, pbc = _dispersion_batch(state)
+        if charges is None:
+            charges = state.system_extras.get('total_charge')
+        if charges is None and self.charge is not None:
+            charges = [self.charge] * cells.shape[0]
+        correction = self._get_cuda_d4().compute_batch_packed(
+            state.positions, state.atomic_numbers, sizes, cells, pbc, charges=charges
+        )
+        return _add_dispersion(results, correction, cells, pbc.all(dim=-1))
 
 
 class Float64Wrapper(ModelInterface):

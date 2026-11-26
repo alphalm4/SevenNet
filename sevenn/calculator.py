@@ -238,7 +238,7 @@ class SevenNetCalculator(Calculator):
         super().__init__(**kwargs)
         self.sevennet_config = None
         self.compute_atomic_virial = compute_atomic_virial
-        self._device_d3 = None
+        self._device_dispersion = None
 
         if isinstance(model, pathlib.PurePath):
             model = str(model)
@@ -448,13 +448,10 @@ class SevenNetCalculator(Calculator):
             output[KEY.EDGE_IDX].shape[1],
         )
 
-    def _add_device_d3(self, flat, meta, positions, properties):
+    def _add_device_dispersion(self, flat, meta, positions, properties):
         atoms = self.atoms
-        atomic = 'energies' in (properties or ())
-        correction = self._device_d3.compute_raw(
-            positions, atoms.numbers, atoms.cell.array, atoms.pbc,
-            atomic_energies=atomic,
-        )
+        atomic = self._wants_atomic_energies(properties)
+        correction = self._device_dispersion(positions, atoms, atomic)
         energy = correction['energy'].reshape(1)
         virial = correction['virial']
         volume = abs(np.linalg.det(atoms.cell.array))
@@ -488,11 +485,18 @@ class SevenNetCalculator(Calculator):
         updated.append(('energy_contributions', torch.Size([2]), torch.float64))
         return packed, updated
 
-    @staticmethod
-    def _corrected_results(flat, meta, num_atoms, num_edges, properties):
+    def _wants_atomic_energies(self, properties):
+        return (
+            'energies' in self.implemented_properties
+            and 'energies' in (properties or ())
+        )
+
+    def _corrected_results(self, flat, meta, num_atoms, num_edges, properties):
         results = _unpack_outputs(flat, meta, num_atoms, num_edges)
-        if 'energies' not in (properties or ()):
+        if not self._wants_atomic_energies(properties):
             results.pop('energies', None)
+        if 'stresses' not in self.implemented_properties:
+            results.pop('stresses', None)
         return results
 
     def _fused_for(self, atoms: Atoms) -> None:
@@ -535,7 +539,7 @@ class SevenNetCalculator(Calculator):
         if pad and self.fused and not self._fused_exact:
             tensors[KEY.EDGE_PADDED] = tensors[KEY.EDGE_VEC].new_zeros(num_edges)
         floats = [k for k, v in tensors.items() if v.is_floating_point()]
-        if self._device_d3 is not None:
+        if self._device_dispersion is not None:
             floats.remove(KEY.POS)
         segments = (
             _num_segments(edge_index, num_atoms, self._segment)
@@ -604,16 +608,18 @@ class SevenNetCalculator(Calculator):
         meta = entry['meta']
         torch.cat([tensors[k].reshape(-1) for k in floats], out=host_in)
         dev_in.copy_(host_in, non_blocking=True)
-        if self._device_d3 is not None:
+        if self._device_dispersion is not None:
             entry['host_pos'].copy_(tensors[KEY.POS])
             positions = entry['static'][KEY.POS]
             positions.copy_(entry['host_pos'], non_blocking=True)
         graph.replay()
-        if self._device_d3 is not None:
-            dev_out, meta = self._add_device_d3(dev_out, meta, positions, properties)
+        if self._device_dispersion is not None:
+            dev_out, meta = self._add_device_dispersion(
+                dev_out, meta, positions, properties
+            )
         host_out.copy_(dev_out, non_blocking=True)
         torch.cuda.current_stream(self.device).synchronize()
-        if self._device_d3 is not None:
+        if self._device_dispersion is not None:
             return self._corrected_results(
                 host_out.numpy(), meta, num_atoms, num_edges, properties
             )
@@ -646,7 +652,7 @@ class SevenNetCalculator(Calculator):
         energies, pad_grads, finite = [], 0.0, True
         for t in (tensors, padded):
             d = AtomGraphData(**{k: v.to(self.device) for k, v in t.items()})
-            if self._device_d3 is not None:
+            if self._device_dispersion is not None:
                 d[KEY.POS] = d[KEY.POS].float()
             for k, v in data.items():
                 if k not in t:
@@ -728,7 +734,9 @@ class SevenNetCalculator(Calculator):
             else:
                 static[k] = v.to(self.device)
         host_pos = (
-            tensors[KEY.POS].pin_memory() if self._device_d3 is not None else None
+            tensors[KEY.POS].pin_memory()
+            if self._device_dispersion is not None
+            else None
         )
         extra = {k: v for k, v in data.items() if k not in tensors}
         num_atoms = static[KEY.ATOMIC_NUMBERS].shape[0]
@@ -736,7 +744,7 @@ class SevenNetCalculator(Calculator):
 
         def run():
             d = AtomGraphData(**static)
-            if self._device_d3 is not None:
+            if self._device_dispersion is not None:
                 d[KEY.POS] = static[KEY.POS].float()
             for k, v in extra.items():
                 d[k] = v
@@ -777,7 +785,7 @@ class SevenNetCalculator(Calculator):
             if self._fused_exact:
                 set_unique_cap(self.model, None)
         current.wait_stream(side)
-        if self._device_d3 is None:
+        if self._device_dispersion is None:
             host_out = torch.empty_like(dev_out, device='cpu').pin_memory()
         else:
             host_out = torch.empty(
@@ -812,7 +820,9 @@ class SevenNetCalculator(Calculator):
         if self.fused:
             self._fused_for(atoms)
         graph_data = unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=False)
-        positions = graph_data.pop(KEY.POS) if self._device_d3 is not None else None
+        positions = (
+            graph_data.pop(KEY.POS) if self._device_dispersion is not None else None
+        )
         data = AtomGraphData.from_numpy_dict(graph_data)
         if positions is not None:
             data[KEY.POS] = torch.from_numpy(positions)
@@ -848,13 +858,15 @@ class SevenNetCalculator(Calculator):
         # a plain dict: the ~110 writes and ~210 reads of a forward skip the
         # torch_geometric Data storage layer (same tensors)
         inputs = _with_topology(data.to_dict(), last[3])
-        if self._device_d3 is None:
+        if self._device_dispersion is None:
             self.results = self.output_to_results(self.model(inputs))
         else:
             positions = inputs[KEY.POS]
             inputs[KEY.POS] = positions.float()
             flat, meta = _pack_outputs(self.model(inputs))
-            flat, meta = self._add_device_d3(flat, meta, positions, properties)
+            flat, meta = self._add_device_dispersion(
+                flat, meta, positions, properties
+            )
             self.results = self._corrected_results(
                 flat.cpu().numpy(), meta, num_atoms, ei.shape[1], properties,
             )
@@ -1004,7 +1016,13 @@ class SevenNetD3Calculator(SumCalculator):
         if device_d3 is None:
             super().__init__([sevennet_calc, d3_calc])
         else:
-            sevennet_calc._device_d3 = device_d3
+            def correction(positions, atoms, atomic):
+                return device_d3.compute_raw(
+                    positions, atoms.numbers, atoms.cell.array, atoms.pbc,
+                    atomic_energies=atomic,
+                )
+
+            sevennet_calc._device_dispersion = correction
             sevennet_calc.implemented_properties.remove('stresses')
             self._gpu_calc = sevennet_calc
             super().__init__([sevennet_calc])
@@ -1020,6 +1038,71 @@ class SevenNetD3Calculator(SumCalculator):
         for key in ('forces', 'stress', 'stresses'):
             if key in self.results:
                 self.results[key] = np.asarray(self.results[key], dtype=np.float32)
+
+
+class SevenNetD4Calculator(SevenNetCalculator):
+    """Combine SevenNet with CUDA-Dispersion D4 on one GPU.
+
+    ``charge`` is the total charge in e. If omitted, use the sum of ASE initial
+    charges, which defaults to zero. ``d4_options`` passes additional options
+    to ``CudaD4Torch``. Other keyword arguments configure SevenNet.
+    """
+
+    def __init__(
+        self,
+        model: Union[str, pathlib.PurePath, AtomGraphSequential] = '7net-0',
+        *,
+        device: Union[torch.device, str] = 'auto',
+        functional_name: str = 'pbe',
+        ewald: str = 'converged',
+        charge: Optional[float] = None,
+        d4_options: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> None:
+        try:
+            from cuda_d4.torch_api import CudaD4Torch
+        except ModuleNotFoundError as exc:
+            if exc.name != 'cuda_d4':
+                raise
+            raise ImportError(
+                'Install the CUDA-Dispersion backend with '
+                '`pip install "sevenn[cudadisp]"`.'
+            ) from exc
+        if not hasattr(CudaD4Torch, 'compute_raw'):
+            raise ImportError('Upgrade with `pip install -U "sevenn[cudadisp]"`.')
+
+        device = torch.device('cuda' if device == 'auto' else device)
+        if device.type != 'cuda' or not torch.cuda.is_available():
+            raise NotImplementedError('SevenNetD4Calculator requires a CUDA GPU.')
+        if charge is not None:
+            charge = float(charge)
+            if not math.isfinite(charge):
+                raise ValueError('charge must be finite')
+
+        super().__init__(model=model, device=device, **kwargs)
+        with torch.cuda.device(device):
+            d4 = CudaD4Torch(
+                functional=functional_name.lower(), ewald=ewald, **(d4_options or {})
+            )
+
+        def correction(positions, atoms, _atomic):
+            total_charge = charge
+            if total_charge is None:
+                initial_charges = atoms.arrays.get('initial_charges')
+                total_charge = (
+                    0.0 if initial_charges is None else float(initial_charges.sum())
+                )
+            return d4.compute_raw(
+                positions,
+                atoms.numbers,
+                atoms.cell.array if atoms.pbc.any() else None,
+                atoms.pbc,
+                charge=total_charge,
+            )
+
+        self._device_dispersion = correction
+        self.implemented_properties.remove('energies')
+        self.implemented_properties.remove('stresses')
 
 
 def _load(name: str) -> ctypes.CDLL:
