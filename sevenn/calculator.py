@@ -1041,11 +1041,10 @@ class SevenNetD3Calculator(SumCalculator):
 
 
 class SevenNetD4Calculator(SevenNetCalculator):
-    """Combine SevenNet with CUDA-Dispersion D4 on one GPU.
+    """Combine SevenNet with CUDA-Dispersion D4 for neutral systems on one GPU.
 
-    ``charge`` is the total charge in e. If omitted, use the sum of ASE initial
-    charges, which defaults to zero. ``d4_options`` passes additional options
-    to ``CudaD4Torch``. Other keyword arguments configure SevenNet.
+    ``d4_options`` passes additional options to ``CudaD4Torch``.
+    Other keyword arguments configure SevenNet.
     """
 
     def __init__(
@@ -1055,10 +1054,12 @@ class SevenNetD4Calculator(SevenNetCalculator):
         device: Union[torch.device, str] = 'auto',
         functional_name: str = 'pbe',
         ewald: str = 'converged',
-        charge: Optional[float] = None,
         d4_options: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> None:
+        if 'charge' in kwargs or 'charges' in kwargs:
+            raise TypeError('SevenNetD4Calculator accepts neutral systems only.')
+
         try:
             from cuda_d4.torch_api import CudaD4Torch
         except ModuleNotFoundError as exc:
@@ -1074,10 +1075,6 @@ class SevenNetD4Calculator(SevenNetCalculator):
         device = torch.device('cuda' if device == 'auto' else device)
         if device.type != 'cuda' or not torch.cuda.is_available():
             raise NotImplementedError('SevenNetD4Calculator requires a CUDA GPU.')
-        if charge is not None:
-            charge = float(charge)
-            if not math.isfinite(charge):
-                raise ValueError('charge must be finite')
 
         super().__init__(model=model, device=device, **kwargs)
         with torch.cuda.device(device):
@@ -1086,18 +1083,11 @@ class SevenNetD4Calculator(SevenNetCalculator):
             )
 
         def correction(positions, atoms, _atomic):
-            total_charge = charge
-            if total_charge is None:
-                initial_charges = atoms.arrays.get('initial_charges')
-                total_charge = (
-                    0.0 if initial_charges is None else float(initial_charges.sum())
-                )
             return d4.compute_raw(
                 positions,
                 atoms.numbers,
                 atoms.cell.array if atoms.pbc.any() else None,
                 atoms.pbc,
-                charge=total_charge,
             )
 
         self._device_dispersion = correction

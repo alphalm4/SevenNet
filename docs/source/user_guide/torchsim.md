@@ -116,23 +116,17 @@ model = SevenNetD3Model(
 ## SevenNet + D4 dispersion
 
 Install `sevenn[torchsim,cudadisp]` and use `SevenNetD4Model` in
-`ts.integrate` or `ts.optimize`. D4 evaluates the batch on CUDA and supports
-molecules and fully periodic cells. Each TorchSim batch uses the same periodic
-boundary conditions.
+`ts.integrate` or `ts.optimize`. The model evaluates the batch on CUDA using
+zero total charge for each molecule or fully periodic cell. Each TorchSim batch
+uses the same periodic boundary conditions.
 
 ```python
-import torch
 import torch_sim as ts
 from sevenn.torchsim import SevenNetD4Model
 
 model = SevenNetD4Model(model="7net-omni", modal="mpa", functional_name="pbe")
 state = ts.initialize_state([atoms_a, atoms_b], device=model.device, dtype=model.dtype)
-state.system_extras["total_charge"] = torch.tensor([0.0, 1.0], device=model.device)
 relaxed_state = ts.optimize(system=state, model=model, optimizer=ts.Optimizer.fire)
 ```
 
-Systems are neutral by default. Set `charge` on the model for one common total
-charge in units of elementary charge, or attach one charge per structure to
-the state as above. For a direct evaluation, `model(state, charges=[0.0, 1.0])`
-overrides both. A molecule gets an energy and force correction, with zero D4
-contribution to stress.
+A molecule gets an energy and force correction, with zero D4 contribution to stress.

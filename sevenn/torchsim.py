@@ -25,7 +25,7 @@ except ImportError as exc:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Mapping
 
     from sevenn.nn.sequential import AtomGraphSequential
 
@@ -608,12 +608,7 @@ class SevenNetD3Model(ModelInterface):
 
 
 class SevenNetD4Model(SevenNetModel):
-    """SevenNet with D4 dispersion from CUDA-Dispersion.
-
-    Pass ``charge`` in e to set a common total charge. Per-system
-    ``state.system_extras['total_charge']`` or explicit ``charges`` in a
-    model call take precedence. The default is neutral systems.
-    """
+    """SevenNet with CUDA-Dispersion D4 for neutral systems."""
 
     def __init__(
         self,
@@ -621,14 +616,12 @@ class SevenNetD4Model(SevenNetModel):
         *,
         functional_name: str = 'pbe',
         ewald: str = 'converged',
-        charge: float | None = None,
         d4_options: Mapping[str, float] | None = None,
         device: torch.device | str = 'auto',
         **kwargs,
     ) -> None:
         device = _cuda_dispersion_device(device, 'SevenNetD4Model')
         super().__init__(model, device=device, **kwargs)
-        self.charge = charge
         self._d4_functional = functional_name
         self._d4_ewald = ewald
         self._d4_options = dict(d4_options or {})
@@ -656,31 +649,22 @@ class SevenNetD4Model(SevenNetModel):
                 )
         return self._cuda_d4
 
-    def forward(
-        self,
-        state: ts.SimState,
-        *,
-        charges: torch.Tensor | Sequence[float] | None = None,
-        **kwargs,
-    ) -> dict[str, torch.Tensor]:
+    def forward(self, state: ts.SimState, **kwargs) -> dict[str, torch.Tensor]:
+        if 'charge' in kwargs or 'charges' in kwargs:
+            raise TypeError('SevenNetD4Model accepts neutral systems only.')
         if state.device != self.device:
             state = state.to(self.device)
         results = super().forward(state, **kwargs)
-        return self._apply_cuda_d4(results, state, charges)
+        return self._apply_cuda_d4(results, state)
 
     def _apply_cuda_d4(
         self,
         results: dict[str, torch.Tensor],
         state: ts.SimState,
-        charges: torch.Tensor | Sequence[float] | None,
     ) -> dict[str, torch.Tensor]:
         sizes, cells, pbc = _dispersion_batch(state)
-        if charges is None:
-            charges = state.system_extras.get('total_charge')
-        if charges is None and self.charge is not None:
-            charges = [self.charge] * cells.shape[0]
         correction = self._get_cuda_d4().compute_batch_packed(
-            state.positions, state.atomic_numbers, sizes, cells, pbc, charges=charges
+            state.positions, state.atomic_numbers, sizes, cells, pbc
         )
         return _add_dispersion(results, correction, cells, pbc.all(dim=-1))
 

@@ -292,17 +292,15 @@ def test_sevennet_d4_cudadisp(atoms_pbc, atoms_mol, periodic):
         pytest.skip('CUDA-Dispersion requires a GPU with compute capability 8.0+')
 
     atoms = atoms_pbc if periodic else atoms_mol
-    charge = None if periodic else -1.0
     model_options = {'device': 'cuda', 'cuda_graph': periodic, 'radial_table': False}
-    combined = SevenNetD4Calculator(charge=charge, **model_options)
+    with pytest.raises(TypeError, match='neutral systems'):
+        SevenNetD4Calculator(charge=1.0, **model_options)
+    combined = SevenNetD4Calculator(**model_options)
     sevennet = SevenNetCalculator(**model_options)
-    dispersion = cuda_d4.CudaD4()
+    d4_result = cuda_d4.CudaD4().compute(atoms)
 
     for initial_charge in (0.0, 1.0, 0.5):
         atoms.set_initial_charges([initial_charge / len(atoms)] * len(atoms))
-        d4_result = dispersion.compute(
-            atoms, charge=initial_charge if charge is None else charge
-        )
         for prop in ('energy', 'free_energy', 'forces', 'stress'):
             baseline = sevennet.get_property(prop, atoms)
             correction = d4_result['energy' if prop == 'free_energy' else prop]

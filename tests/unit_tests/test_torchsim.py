@@ -162,28 +162,24 @@ def test_sevennet_d4_cuda_dispersion(periodic):
     )
     structures[1].rattle(stdev=0.03, seed=317)
     options = {'disp2_cutoff': 30.0, 'disp3_cutoff': 20.0}
-    model = SevenNetD4Model('7net-0', charge=-1.0, d4_options=options)
+    model = SevenNetD4Model('7net-0', d4_options=options)
     state = ts.initialize_state(structures, device=model.device, dtype=model.dtype)
     state.system_extras['total_charge'] = torch.tensor(
         [0.0, 1.0], device=model.device
     )
+    with pytest.raises(TypeError, match='neutral systems'):
+        model(state, charges=[-1.0, 0.0])
     bare = SevenNetModel.forward(model, state)
-    d4 = cuda_d4.CudaD4(**options)
-
-    for charges, actual in (
-        ([0.0, 1.0], model(state.clone())),
-        ([-1.0, 0.0], model(state, charges=[-1.0, 0.0])),
-    ):
-        reference = d4.compute_batch(structures, charges=charges)
-        correction = {
-            'energy': torch.tensor([r['energy'] for r in reference]),
-            'forces': torch.cat([torch.from_numpy(r['forces']) for r in reference]),
-            'stress': torch.zeros_like(bare['stress']),
-        }
-        if periodic:
-            correction['stress'] = voigt_6_to_full_3x3_stress(
-                torch.stack([torch.from_numpy(r['stress']) for r in reference])
-            )
-        for name, result in actual.items():
-            expected = bare[name] + correction[name].to(bare[name])
-            torch.testing.assert_close(result, expected, rtol=2e-5, atol=2e-6)
+    reference = cuda_d4.CudaD4(**options).compute_batch(structures)
+    correction = {
+        'energy': torch.tensor([r['energy'] for r in reference]),
+        'forces': torch.cat([torch.from_numpy(r['forces']) for r in reference]),
+        'stress': torch.zeros_like(bare['stress']),
+    }
+    if periodic:
+        correction['stress'] = voigt_6_to_full_3x3_stress(
+            torch.stack([torch.from_numpy(r['stress']) for r in reference])
+        )
+    for name, result in model(state).items():
+        expected = bare[name] + correction[name].to(bare[name])
+        torch.testing.assert_close(result, expected, rtol=2e-5, atol=2e-6)
