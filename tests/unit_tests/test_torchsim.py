@@ -34,7 +34,7 @@ if not TORCH_SIM_AVAILABLE:
 import sevenn.util
 from sevenn.calculator import SevenNetCalculator
 from sevenn.nn.sequential import AtomGraphSequential
-from sevenn.torchsim import SevenNetModel
+from sevenn.torchsim import SevenNetD3Model, SevenNetModel
 
 # Test configuration
 model_name = 'sevennet-mf-ompa'
@@ -99,3 +99,45 @@ def test_sevenn_model_consistency(
     NOTE: sevenn is broken for the benzene simstate is ase comparison."""
     sim_state = SIMSTATE_BULK_GENERATORS[sim_state_name](DEVICE, DTYPE)
     assert_model_calculator_consistency(sevenn_model, sevenn_calculator, sim_state)
+
+
+@pytest.mark.parametrize('d3_mode', ['batch', 'serial'])
+def test_sevennet_d3_cuda_dispersion(d3_mode):
+    cuda_d3 = pytest.importorskip('cuda_d3')
+    torch_api = pytest.importorskip('cuda_d3.torch_api')
+    if not hasattr(torch_api.CudaD3Torch, 'compute_batch_packed'):
+        pytest.skip('CUDA-Dispersion 0.2.0 or later is required')
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip('CUDA-Dispersion requires a GPU with compute capability 8.0+')
+
+    import torch_sim as ts
+    from ase.build import bulk
+    from torch_sim.elastic import voigt_6_to_full_3x3_stress
+
+    structures = [
+        bulk('Si', 'diamond', a=5.43, cubic=True),
+        bulk('Cu', 'fcc', a=3.58, cubic=True).repeat((2, 2, 1)),
+    ]
+    structures[1].rattle(stdev=0.03, seed=317)
+    model = SevenNetD3Model(
+        '7net-0',
+        device='cuda',
+        d3_backend='cuda-dispersion',
+        d3_mode=d3_mode,
+    )
+    state = ts.initialize_state(structures, device=model.device, dtype=model.dtype)
+    bare = model.sevennet(state)
+    actual = model(state)
+
+    d3 = cuda_d3.CudaD3()
+    reference = [d3.compute(atoms) for atoms in structures]
+    correction = {
+        'energy': torch.tensor([r['energy'] for r in reference]),
+        'forces': torch.cat([torch.from_numpy(r['forces']) for r in reference]),
+        'stress': voigt_6_to_full_3x3_stress(
+            torch.stack([torch.from_numpy(r['stress']) for r in reference])
+        ),
+    }
+    for name, result in actual.items():
+        expected = bare[name] + correction[name].to(bare[name])
+        torch.testing.assert_close(result, expected, rtol=2e-5, atol=2e-6)

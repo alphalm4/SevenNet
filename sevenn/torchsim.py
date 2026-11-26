@@ -304,10 +304,13 @@ class SevenNetD3Model(ModelInterface):
     summing their E/F/S outputs.
     Same forward signature with SevenNetModel.
 
-    D3 can be evaluated two ways, selected by 'd3_mode':
+    Select 'cuda-dispersion' with d3_backend to evaluate D3 on the CUDA tensors
+    of the simulation state. The default backend is 'builtin'.
 
-    - serial: per-system loop over the ASE-style D3Calculator.
-    - batch : a single batched CUDA kernel launch (BatchD3)
+    Select the evaluation mode with d3_mode:
+
+    - serial: evaluate each system individually.
+    - batch: evaluate all systems together.
     - auto (default): pick 'batch' when the number of systems B
       is larger than d3_batch_threshold, otherwise 'serial'.
 
@@ -332,6 +335,7 @@ class SevenNetD3Model(ModelInterface):
         functional_name: str = 'pbe',
         vdw_cutoff: float = 9000,
         cn_cutoff: float = 1600,
+        d3_backend: str = 'builtin',
     ) -> None:
         super().__init__()
 
@@ -339,6 +343,16 @@ class SevenNetD3Model(ModelInterface):
             raise ValueError(
                 f"d3_mode must be 'auto', 'serial' or 'batch', got {d3_mode!r}"
             )
+        if d3_backend not in ('builtin', 'cuda-dispersion'):
+            raise ValueError(f'Unknown D3 backend: {d3_backend!r}')
+        if d3_backend == 'cuda-dispersion':
+            device = torch.device('cuda' if device == 'auto' else device)
+            if device.type != 'cuda' or not torch.cuda.is_available():
+                raise ValueError(
+                    "d3_backend='cuda-dispersion' requires a CUDA device"
+                )
+            if device.index is None:
+                device = torch.device('cuda', torch.cuda.current_device())
 
         self.sevennet = SevenNetModel(
             model,
@@ -352,12 +366,9 @@ class SevenNetD3Model(ModelInterface):
             dtype=dtype,
         )
 
+        self.d3_backend = d3_backend
         self.d3_mode = d3_mode
         self.d3_batch_threshold = d3_batch_threshold
-        # D3 backends are created lazily on first use:
-        # 'serial' never touches CUDA, and
-        # 'auto' avoids compiling the batched kernel unless a batch
-        # actually exceeds the threshold.
         self._d3_kwargs = {
             'damping_type': damping_type,
             'functional_name': functional_name,
@@ -366,6 +377,7 @@ class SevenNetD3Model(ModelInterface):
         }
         self._serial_d3 = None
         self._batch_d3: BatchD3 | None = None
+        self._cuda_d3 = None
 
         # Proxy ModelInterface attributes from inner SevenNetModel
         self._device = self.sevennet._device
@@ -398,33 +410,102 @@ class SevenNetD3Model(ModelInterface):
             self._batch_d3 = BatchD3(**self._d3_kwargs)
         return self._batch_d3
 
+    def _get_cuda_d3(self):
+        if self._cuda_d3 is None:
+            try:
+                from cuda_d3.torch_api import CudaD3Torch
+            except ModuleNotFoundError as exc:
+                if exc.name not in ('cuda_d3', 'cuda_d3.torch_api'):
+                    raise
+                raise ImportError(
+                    'Install the CUDA-Dispersion backend with '
+                    '`pip install "sevenn[cudadisp]"`.'
+                ) from exc
+
+            if not hasattr(CudaD3Torch, 'compute_batch_packed'):
+                raise ImportError(
+                    'TorchSim requires CUDA-Dispersion 0.2.0 or later.'
+                )
+            with torch.cuda.device(self._device):
+                self._cuda_d3 = CudaD3Torch(
+                    damping=self._d3_kwargs['damping_type'].lower(),
+                    functional=self._d3_kwargs['functional_name'].lower(),
+                    vdw_cutoff=self._d3_kwargs['vdw_cutoff'],
+                    cn_cutoff=self._d3_kwargs['cn_cutoff'],
+                )
+        return self._cuda_d3
+
     def forward(self, state: ts.SimState, **kwargs) -> dict[str, torch.Tensor]:
         """Forward pass: SevenNet (batched GPU) + D3 (serial or batched).
 
         Returns combined {"energy", "forces", "stress"} dict.
         """
+        if self.d3_backend == 'cuda-dispersion' and state.device != self._device:
+            state = state.to(self._device)
         results = self.sevennet(state, **kwargs)
-        results = {k: v.clone() for k, v in results.items()}
-
-        # Sync PyTorch before D3 ctypes kernel
-        if self._device.type == 'cuda':
-            torch.cuda.synchronize(self._device)
-
-        # D3 wraps positions internally (load_atom_info applies floor()
-        # in fractional coords), so no need to wrap here.
-
-        # Prepare batch data from SimState
-        B = int(state.system_idx.max().item() + 1)
+        B = results['energy'].shape[0]
         use_batch_d3 = self.d3_mode == 'batch' or (
             self.d3_mode == 'auto' and B > self.d3_batch_threshold
         )
+        if self.d3_backend == 'cuda-dispersion':
+            return self._apply_cuda_d3(results, state, use_batch_d3)
 
+        results = {k: v.clone() for k, v in results.items()}
+        if self._device.type == 'cuda':
+            torch.cuda.synchronize(self._device)
         if use_batch_d3:
             self._apply_batch_d3(results, state, B)
         else:
             self._apply_serial_d3(results, state)
 
         return results
+
+    def _apply_cuda_d3(
+        self,
+        results: dict[str, torch.Tensor],
+        state: ts.SimState,
+        use_batch: bool,
+    ) -> dict[str, torch.Tensor]:
+        d3 = self._get_cuda_d3()
+        cells = state.row_vector_cell
+        pbc = state.pbc.expand(cells.shape[0], 3)
+        systems = torch.arange(
+            cells.shape[0] + 1, device=state.device, dtype=state.system_idx.dtype
+        )
+        # TorchSim groups atoms by system. The cell count fixes the output shape.
+        sizes = torch.searchsorted(state.system_idx, systems).diff()
+        if use_batch:
+            correction = d3.compute_batch_packed(
+                state.positions, state.atomic_numbers, sizes, cells, pbc
+            )
+        else:
+            sizes = sizes.tolist()
+            corrections = [
+                d3.compute_raw(positions, numbers, cell, periodic)
+                for positions, numbers, cell, periodic in zip(
+                    state.positions.split(sizes),
+                    state.atomic_numbers.split(sizes),
+                    cells,
+                    pbc,
+                )
+            ]
+            correction = {
+                'energy': torch.stack([r['energy'] for r in corrections]),
+                'forces': torch.cat([r['forces'] for r in corrections]),
+                'virial': torch.stack([r['virial'] for r in corrections]),
+            }
+
+        volumes = torch.linalg.det(cells.detach()).abs()[:, None, None]
+        valid = volumes > 0
+        if not use_batch:
+            valid = valid & pbc.any(dim=-1)[:, None, None]
+        stress = -correction['virial'] / volumes.masked_fill(~valid, 1.0)
+        correction['stress'] = stress.masked_fill(~valid, 0.0)
+        return {
+            name: result + correction[name].to(result.dtype)
+            if name in correction else result
+            for name, result in results.items()
+        }
 
     def _apply_serial_d3(
         self, results: dict[str, torch.Tensor], state: ts.SimState,

@@ -159,6 +159,10 @@ def _unpack_outputs(flat: np.ndarray, meta, num_atoms: int, num_edges: int):
     }
     if KEY.PRED_ATOMIC_VIRIAL in out:
         results['stresses'] = out[KEY.PRED_ATOMIC_VIRIAL][:num_atoms, :]
+    if 'energy_contributions' in out:
+        contributions = out['energy_contributions'].tolist()
+        results['energy_contributions'] = contributions
+        results['free_energy_contributions'] = contributions.copy()
     return results
 
 
@@ -234,6 +238,7 @@ class SevenNetCalculator(Calculator):
         super().__init__(**kwargs)
         self.sevennet_config = None
         self.compute_atomic_virial = compute_atomic_virial
+        self._device_d3 = None
 
         if isinstance(model, pathlib.PurePath):
             model = str(model)
@@ -443,6 +448,53 @@ class SevenNetCalculator(Calculator):
             output[KEY.EDGE_IDX].shape[1],
         )
 
+    def _add_device_d3(self, flat, meta, positions, properties):
+        atoms = self.atoms
+        atomic = 'energies' in (properties or ())
+        correction = self._device_d3.compute_raw(
+            positions, atoms.numbers, atoms.cell.array, atoms.pbc,
+            atomic_energies=atomic,
+        )
+        energy = correction['energy'].reshape(1)
+        virial = correction['virial']
+        volume = abs(np.linalg.det(atoms.cell.array))
+        stress = float('nan')
+        if atoms.pbc.all() and volume > 0:
+            stress = torch.stack((
+                virial[0, 0], virial[1, 1], virial[2, 2],
+                virial[0, 1], virial[1, 2], virial[0, 2],
+            )) / volume
+        values = {
+            KEY.PRED_TOTAL_ENERGY: energy,
+            KEY.PRED_FORCE: correction['forces'],
+            KEY.PRED_STRESS: stress,
+        }
+        if atomic:
+            values[KEY.ATOMIC_ENERGY] = correction['energies']
+
+        packed = torch.cat((flat, flat[:1], energy))
+        offset, updated = 0, []
+        for key, shape, dtype in meta:
+            end = offset + shape.numel()
+            if key in values:
+                value = values[key]
+                packed[offset:end].add_(
+                    value.reshape(-1) if isinstance(value, torch.Tensor) else value
+                )
+            if key in (KEY.PRED_TOTAL_ENERGY, KEY.ATOMIC_ENERGY):
+                dtype = torch.float64
+            updated.append((key, shape, dtype))
+            offset = end
+        updated.append(('energy_contributions', torch.Size([2]), torch.float64))
+        return packed, updated
+
+    @staticmethod
+    def _corrected_results(flat, meta, num_atoms, num_edges, properties):
+        results = _unpack_outputs(flat, meta, num_atoms, num_edges)
+        if 'energies' not in (properties or ()):
+            results.pop('energies', None)
+        return results
+
     def _fused_for(self, atoms: Atoms) -> None:
         """Extend the species tables when the structure includes new species."""
         numbers = set(atoms.get_atomic_numbers().tolist())
@@ -467,7 +519,9 @@ class SevenNetCalculator(Calculator):
     _FREE_CAPTURES = 8
     _REPLAYS_PER_CAPTURE = 2
 
-    def _graph_results(self, data: AtomGraphData) -> Optional[Dict[str, Any]]:
+    def _graph_results(
+        self, data: AtomGraphData, properties=None
+    ) -> Optional[Dict[str, Any]]:
         """Replay a compatible capture or return None for eager evaluation."""
         if self._segment == -1:
             self._segment = self._lunatp_segment()
@@ -481,6 +535,8 @@ class SevenNetCalculator(Calculator):
         if pad and self.fused and not self._fused_exact:
             tensors[KEY.EDGE_PADDED] = tensors[KEY.EDGE_VEC].new_zeros(num_edges)
         floats = [k for k, v in tensors.items() if v.is_floating_point()]
+        if self._device_d3 is not None:
+            floats.remove(KEY.POS)
         segments = (
             _num_segments(edge_index, num_atoms, self._segment)
             if self._segment else None
@@ -490,7 +546,8 @@ class SevenNetCalculator(Calculator):
         # index, and the shapes of the tensors and LunaTP segments.
         key = tuple(
             (k, None if pad and k in edge_keys else v.shape,
-             None if k in floats or k == KEY.EDGE_IDX else v.numpy().tobytes())
+             None if v.is_floating_point() or k == KEY.EDGE_IDX
+             else v.numpy().tobytes())
             for k, v in tensors.items()
         ) + tuple((k, repr(v)) for k, v in data.items() if k not in tensors)
         key += (('segments', segments),)
@@ -544,14 +601,25 @@ class SevenNetCalculator(Calculator):
 
         graph, dev_in, host_in = entry['graph'], entry['dev_in'], entry['host_in']
         dev_out, host_out = entry['dev_out'], entry['host_out']
+        meta = entry['meta']
         torch.cat([tensors[k].reshape(-1) for k in floats], out=host_in)
         dev_in.copy_(host_in, non_blocking=True)
+        if self._device_d3 is not None:
+            entry['host_pos'].copy_(tensors[KEY.POS])
+            positions = entry['static'][KEY.POS]
+            positions.copy_(entry['host_pos'], non_blocking=True)
         graph.replay()
+        if self._device_d3 is not None:
+            dev_out, meta = self._add_device_d3(dev_out, meta, positions, properties)
         host_out.copy_(dev_out, non_blocking=True)
         torch.cuda.current_stream(self.device).synchronize()
+        if self._device_d3 is not None:
+            return self._corrected_results(
+                host_out.numpy(), meta, num_atoms, num_edges, properties
+            )
         return _unpack_outputs(
             host_out.numpy(),  # astype copies: results outlive host_out
-            entry['meta'],
+            meta,
             num_atoms,
             num_edges,
         )
@@ -578,6 +646,8 @@ class SevenNetCalculator(Calculator):
         energies, pad_grads, finite = [], 0.0, True
         for t in (tensors, padded):
             d = AtomGraphData(**{k: v.to(self.device) for k, v in t.items()})
+            if self._device_d3 is not None:
+                d[KEY.POS] = d[KEY.POS].float()
             for k, v in data.items():
                 if k not in t:
                     d[k] = v
@@ -657,12 +727,17 @@ class SevenNetCalculator(Calculator):
                 offset += v.numel()
             else:
                 static[k] = v.to(self.device)
+        host_pos = (
+            tensors[KEY.POS].pin_memory() if self._device_d3 is not None else None
+        )
         extra = {k: v for k, v in data.items() if k not in tensors}
         num_atoms = static[KEY.ATOMIC_NUMBERS].shape[0]
         topology = self._lunatp_topology(static[KEY.EDGE_IDX], num_atoms)
 
         def run():
             d = AtomGraphData(**static)
+            if self._device_d3 is not None:
+                d[KEY.POS] = static[KEY.POS].float()
             for k, v in extra.items():
                 d[k] = v
             return _pack_outputs(self.model(_with_topology(d, topology)))
@@ -702,10 +777,17 @@ class SevenNetCalculator(Calculator):
             if self._fused_exact:
                 set_unique_cap(self.model, None)
         current.wait_stream(side)
-        host_out = torch.empty_like(dev_out, device='cpu').pin_memory()
+        if self._device_d3 is None:
+            host_out = torch.empty_like(dev_out, device='cpu').pin_memory()
+        else:
+            host_out = torch.empty(
+                dev_out.numel() + 2, dtype=torch.float64, device='cpu',
+                pin_memory=True,
+            )
         return {
             'graph': graph, 'dev_in': dev_in, 'host_in': host_in,
-            'dev_out': dev_out, 'host_out': host_out, 'meta': meta,
+            'dev_out': dev_out, 'host_out': host_out, 'host_pos': host_pos,
+            'meta': meta,
             'static': static, 'edge_index': tensors[KEY.EDGE_IDX],
             'topology': topology, 'num_atoms': num_atoms,
         }
@@ -729,15 +811,17 @@ class SevenNetCalculator(Calculator):
             raise ValueError('No atoms to evaluate')
         if self.fused:
             self._fused_for(atoms)
-        data = AtomGraphData.from_numpy_dict(
-            unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=False)
-        )
+        graph_data = unlabeled_atoms_to_graph(atoms, self.cutoff, with_shift=False)
+        positions = graph_data.pop(KEY.POS) if self._device_d3 is not None else None
+        data = AtomGraphData.from_numpy_dict(graph_data)
+        if positions is not None:
+            data[KEY.POS] = torch.from_numpy(positions)
         if self.modal:
             data[KEY.DATA_MODALITY] = self.modal
         _sort_edges(data)
 
         if self.cuda_graph and self._cuda_graph_supported:
-            results = self._graph_results(data)
+            results = self._graph_results(data, properties)
             if results is not None:
                 self.results = results
                 return
@@ -763,8 +847,17 @@ class SevenNetCalculator(Calculator):
 
         # a plain dict: the ~110 writes and ~210 reads of a forward skip the
         # torch_geometric Data storage layer (same tensors)
-        output = self.model(_with_topology(data.to_dict(), last[3]))
-        self.results = self.output_to_results(output)
+        inputs = _with_topology(data.to_dict(), last[3])
+        if self._device_d3 is None:
+            self.results = self.output_to_results(self.model(inputs))
+        else:
+            positions = inputs[KEY.POS]
+            inputs[KEY.POS] = positions.float()
+            flat, meta = _pack_outputs(self.model(inputs))
+            flat, meta = self._add_device_d3(flat, meta, positions, properties)
+            self.results = self._corrected_results(
+                flat.cpu().numpy(), meta, num_atoms, ei.shape[1], properties,
+            )
 
 
 class SevenNetD3Calculator(SumCalculator):
@@ -839,6 +932,7 @@ class SevenNetD3Calculator(SumCalculator):
             )
 
         d3_options = dict(kwargs, vdw_cutoff=vdw_cutoff, cn_cutoff=cn_cutoff)
+        device_d3 = None
         if d3_backend == 'builtin':
             d3_calc = D3Calculator(
                 damping_type=damping_type,
@@ -860,7 +954,26 @@ class SevenNetD3Calculator(SumCalculator):
                 raise NotImplementedError('CUDA-Dispersion requires a CUDA GPU.')
 
             d3_device = torch.device('cuda' if device == 'auto' else device)
-            with torch.cuda.device(d3_device if d3_device.type == 'cuda' else None):
+            if d3_device.type == 'cuda':
+                from cuda_d3.torch_api import CudaD3Torch
+
+                if not hasattr(CudaD3Torch, 'compute_raw'):
+                    raise ImportError(
+                        'Upgrade with `pip install -U "sevenn[cudadisp]"`.'
+                    )
+                options = {
+                    k: d3_options[k]
+                    for k in ('vdw_cutoff', 'cn_cutoff', 'cn_func', 'cn_rcut', 's9')
+                    if k in d3_options
+                }
+                with torch.cuda.device(d3_device):
+                    device_d3 = CudaD3Torch(
+                        damping=damping_type.lower(),
+                        functional=functional_name.lower(),
+                        **options,
+                    )
+                d3_calc = None
+            else:
                 d3_calc = CudaD3Calculator(
                     damping=damping_type.lower(),
                     functional=functional_name.lower(),
@@ -887,11 +1000,23 @@ class SevenNetD3Calculator(SumCalculator):
             **kwargs,
         )
 
-        super().__init__([sevennet_calc, d3_calc])
+        self._gpu_calc = None
+        if device_d3 is None:
+            super().__init__([sevennet_calc, d3_calc])
+        else:
+            sevennet_calc._device_d3 = device_d3
+            sevennet_calc.implemented_properties.remove('stresses')
+            self._gpu_calc = sevennet_calc
+            super().__init__([sevennet_calc])
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
         # To match the precision of SevenNetCalculator output
-        super().calculate(atoms, properties, system_changes)
+        if self._gpu_calc is None:
+            super().calculate(atoms, properties, system_changes)
+        else:
+            self._gpu_calc.calculate(atoms, properties, system_changes)
+            self.atoms = self._gpu_calc.atoms
+            self.results = self._gpu_calc.results.copy()
         for key in ('forces', 'stress', 'stresses'):
             if key in self.results:
                 self.results[key] = np.asarray(self.results[key], dtype=np.float32)

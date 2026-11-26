@@ -83,10 +83,22 @@ It requires a CUDA GPU (the D3 backends are GPU-only) and accepts the same D3 pa
 
 ### Choosing the D3 backend
 
-D3 can be evaluated two ways, selected by `d3_mode`:
+The default `d3_backend="builtin"` uses SevenNet's D3 implementation. Use
+`d3_backend="cuda-dispersion"` to pass TorchSim's CUDA coordinates and atomic
+numbers to CUDA-Dispersion and add its energy, forces, and stress on the GPU.
 
-- `serial`: a per-system loop over the ASE-style `D3Calculator`.
-- `batch`: a single batched CUDA kernel launch that computes D3 for all systems at once.
+```bash
+pip install 'sevenn[torchsim,cudadisp]'
+```
+
+```python
+model = SevenNetD3Model(model="7net-omni", modal="mpa", d3_backend="cuda-dispersion")
+```
+
+Both backends accept `d3_mode`:
+
+- `serial`: evaluate each system individually.
+- `batch`: evaluate all systems together.
 - `auto` (default): use `batch` when the number of systems in the batch exceeds `d3_batch_threshold` (default `4`), otherwise `serial`.
 
 The `auto` heuristic exists because the two paths have different trade-offs: the batched kernel amortizes its per-call overhead across many systems, so it wins for large batches, while the serial loop is cheaper for the few-system case. Tune the cutoff with `d3_batch_threshold`, or force a single backend with `d3_mode`:

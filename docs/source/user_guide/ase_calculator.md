@@ -56,8 +56,10 @@ CUDA_ARCHS=sm_80 NVCC="$(command -v nvcc)" \
     python -m pip install --no-binary=cuda-dispersion '.[cudadisp]'
 ```
 
-The same D3 functional, damping, and cutoff arguments apply. The dispersion
-stress is `NaN` for structures without full periodicity. See the
+With SevenNet on CUDA, the two calculations share the uploaded coordinates and
+combine their results on the GPU before returning them to ASE. The same D3
+functional, damping, and cutoff arguments apply. The dispersion stress is `NaN`
+for structures without full periodicity. See the
 [CUDA-Dispersion documentation](https://github.com/alphalm4/CUDA-Dispersion)
 for its CUDA toolkit requirements and dispersion options.
 

@@ -245,12 +245,13 @@ def test_sevennet_d3_cudadisp_missing_dependency(monkeypatch):
         SevenNetD3Calculator(d3_backend='cuda-dispersion')
 
 
-def test_sevennet_d3_cudadisp(atoms_pbc):
+@pytest.mark.parametrize('cuda_graph', [False, True])
+def test_sevennet_d3_cudadisp(atoms_pbc, cuda_graph):
     cuda_d3 = pytest.importorskip('cuda_d3')
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         pytest.skip('CUDA-Dispersion requires a GPU with compute capability 8.0+')
 
-    model_options = dict(device='cuda', cuda_graph=False, radial_table=False)
+    model_options = dict(device='cuda', cuda_graph=cuda_graph, radial_table=False)
     combined = SevenNetD3Calculator(
         d3_backend='cuda-dispersion',
         functional_name='PBE',
@@ -264,13 +265,22 @@ def test_sevennet_d3_cudadisp(atoms_pbc):
         functional='pbe', damping='damp_zero', vdw_cutoff=1200, cn_cutoff=400
     )
 
-    for prop in ('energy', 'free_energy', 'forces', 'stress'):
-        expected = sevennet.get_property(prop, atoms_pbc) + dispersion.get_property(
-            prop, atoms_pbc
-        )
+    for _ in range(3 if cuda_graph else 1):
+        for prop in ('energy', 'free_energy', 'forces', 'stress', 'energies'):
+            baseline = sevennet.get_property(prop, atoms_pbc)
+            expected = baseline + dispersion.get_property(prop, atoms_pbc)
+            np.testing.assert_allclose(
+                combined.get_property(prop, atoms_pbc), expected,
+                rtol=1e-5, atol=1e-6,
+            )
         np.testing.assert_allclose(
-            combined.get_property(prop, atoms_pbc), expected, rtol=1e-5, atol=1e-6
+            combined.results['energy_contributions'],
+            [sevennet.results['energy'], dispersion.results['energy']],
+            rtol=1e-5, atol=1e-6,
         )
+        atoms_pbc.positions[0, 0] += 0.001
+    if cuda_graph:
+        assert combined._gpu_calc._n_replays > 0
 
 
 def test_d3_cal_pbc(atoms_pbc, d3_cal):
